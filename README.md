@@ -1,5 +1,5 @@
 
-# Ansible playbook about kubernetes install on debian
+# Ansible playbook about deploying kubernetes single control-plane cluster on debian linux cluster
 
 
 
