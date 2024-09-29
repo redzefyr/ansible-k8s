@@ -1,0 +1,261 @@
+- name: "Prepare playbook..."
+  vars:
+    CONTROL_PLANE_SIZE: "{{ groups['control_plane'] | length }}"
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: "Check control-plane size"
+      ansible.builtin.fail:
+        msg: "this playbook supports only one control plane host : current inventory = {{ groups['control_plane'] | length }}"
+      when: "groups['control_plane'] | length != 1"
+
+    - name: "Check temporary downloaded file"
+      become: false
+      ansible.builtin.stat:
+        path: "/tmp/containerd-{{ containerd_version }}-linux-amd64.tar.gz"
+      register: containerd_download
+
+    - name: "Download containerd"
+      become: false
+      ansible.builtin.get_url:
+        url: "https://github.com/containerd/containerd/releases/download/v{{ containerd_version }}/containerd-{{ containerd_version }}-linux-amd64.tar.gz"
+        checksum: "sha256:https://github.com/containerd/containerd/releases/download/v{{ containerd_version }}/containerd-{{ containerd_version }}-linux-amd64.tar.gz.sha256sum"
+        dest: "/tmp"
+      when: not containerd_download.stat.exists
+
+- name: "Install k8s"
+  hosts: k8s_cluster
+  any_errors_fatal: true
+  become: true
+  tasks:
+    - name: "Configure debian system"
+      block:
+        - name: "Load kernel modules"
+          community.general.modprobe:
+            name: "{{ item }}"
+            state: present
+            persistent: present
+          loop:
+            - overlay
+            - br_netfilter
+
+        - name: "Configure sysctl"
+          ansible.posix.sysctl:
+            name: "{{ item }}"
+            value: '1'
+            sysctl_set: true
+            state: present
+            reload: true
+          loop:
+            - net.bridge.bridge-nf-call-iptables
+            - net.bridge.bridge-nf-call-ip6tables
+            - net.ipv4.ip_forward
+
+        - name: "Disable swap partition"
+          ansible.builtin.replace:
+            path: /etc/fstab
+            regexp: '^([^#].*?\sswap\s+sw)(\s+.*)$'
+            replace: '\1,noauto\2'
+          register: swap_fstab
+
+        - name: "Turn off swap"
+          ansible.builtin.shell: swapoff -a
+          when: swap_fstab.changed
+
+        - name: "Install required packages"
+          ansible.builtin.apt:
+            pkg:
+              - curl
+              - apt-transport-https
+              - ca-certificates
+              - gpg
+            state: latest
+
+        - name: "Edit /etc/hosts"
+          ansible.builtin.lineinfile:
+            path: /etc/hosts
+            line: "{{ hostvars[item]['ansible_facts']['default_ipv4']['address'] }} {{ hostvars[item]['ansible_facts']['hostname'] }}"
+          loop: "{{ ansible_play_hosts }}"
+
+    - name: "Configure containerd {{ containerd_version }}"
+      block:
+        - name: "Unarchive"
+          ansible.builtin.unarchive:
+            src: "/tmp/containerd-{{ containerd_version }}-linux-amd64.tar.gz"
+            dest: "/usr/local"
+
+        - name: "Check configuration file"
+          ansible.builtin.stat:
+            path: "/etc/containerd/config.toml"
+          register: containerd_config_file
+
+        - name: "Create configuration file"
+          ansible.builtin.shell: |
+            mkdir -p /etc/containerd/
+            containerd config default | sed 's/SystemdCgroup \= false/SystemdCgroup \= true/g' | tee /etc/containerd/config.toml
+          when: not containerd_config_file.stat.exists
+
+        - name: "Check systemd unit file"
+          ansible.builtin.stat:
+            path: "/usr/lib/systemd/system/containerd.service"
+          register: systemd_unit_file
+
+        - name: "Download systemd unit file"
+          ansible.builtin.get_url:
+            url: "https://raw.githubusercontent.com/containerd/containerd/main/containerd.service"
+            dest: "/usr/lib/systemd/system/"
+          when: not systemd_unit_file.stat.exists
+
+        - name: "Set containerd to auto-start at boot"
+          ansible.builtin.systemd_service:
+            daemon_reload: true
+            name: containerd
+            enabled: true
+            state: started
+
+    - name: "Configure kubeadm"
+      block:
+        - name: "Download apt key"
+          ansible.builtin.apt_key:
+            keyring: "/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+            url: "https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key"
+
+        - name: "Add apt repository"
+          ansible.builtin.apt_repository:
+            repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /"
+            state: present
+
+        - name: "Install kubernetes packages"
+          ansible.builtin.apt:
+            pkg:
+              - kubelet
+              - kubectl
+              - kubeadm
+              - kubernetes-cni
+              - jq
+              - runc
+            state: latest
+            update_cache: true
+            allow_change_held_packages: true
+
+        - name: "Hold kubernetes dpkg packages to prevent upgrade"
+          ansible.builtin.dpkg_selections:
+            name: "{{ item }}"
+            selection: hold
+          loop:
+            - kubelet
+            - kubeadm
+            - kubectl
+
+        - name: "Check CRI config runtime-endpoint"
+          ansible.builtin.shell: |
+            crictl config --get runtime-endpoint
+          register: runtime_endpoint
+          changed_when: false
+
+        - name: "Set CRI config runtime-endpoint"
+          ansible.builtin.shell: |
+            crictl config --set runtime-endpoint=unix:///run/containerd/containerd.sock
+          when: not runtime_endpoint.stdout
+
+        - name: "Check CRI config image-endpoint"
+          ansible.builtin.shell: |
+            crictl config --get image-endpoint
+          register: image_endpoint
+          changed_when: false
+
+        - name: "Set CRI config image-endpoint"
+          ansible.builtin.shell: |
+            crictl config --set image-endpoint=unix:///run/containerd/containerd.sock
+          when: not image_endpoint.stdout
+
+- name: "Configure control plane"
+  hosts: control_plane
+  become: true
+  tasks:
+    - name: "Create k8s Cluster"
+      block:
+      - name: "Initialize k8s cluster"
+        ansible.builtin.shell: |
+          kubeadm init --control-plane-endpoint={{ inventory_hostname }}:6443 --pod-network-cidr={{ pod_network_cidr }} --upload-certs
+
+      - name: "Create worker join token"
+        ansible.builtin.shell: |
+          kubeadm token create --print-join-command
+        register: bootstrap_token
+
+      - name: "Register join command"
+        add_host:
+          name: "K8S_TOKEN_HOLDER"
+          join_command: "{{ bootstrap_token.stdout }}"
+        changed_when: false
+
+    - name: "KubeConfig setup"
+      block:
+      - name: "Ensure root's ~/.kube/ exists"
+        ansible.builtin.file:
+          path: "~/.kube/"
+          state: directory
+
+      - name: "Copy admin.conf for root"
+        ansible.builtin.copy:
+          src: "/etc/kubernetes/admin.conf"
+          remote_src: true
+          dest: "~/.kube/config"
+
+      - name: "Ensure user's ~/.kube/ exists"
+        become: false
+        ansible.builtin.file:
+          path: "~/.kube/"
+          state: directory
+        register: kube_config_path
+
+      - name: "Copy admin.conf for {{ ansible_facts.env.SUDO_USER }}"
+        ansible.builtin.copy:
+          src: "/etc/kubernetes/admin.conf"
+          remote_src: true
+          dest: "{{ kube_config_path.path }}/config"
+          owner: "{{ ansible_facts.env.SUDO_UID }}"
+          group: "{{ ansible_facts.env.SUDO_GID }}"
+
+    - name: "Configure CNI"
+      block:
+        - name: "Install Calico operator and custom resource definitions"
+          ansible.builtin.shell: |
+            kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v{{ calico_version }}/manifests/tigera-operator.yaml
+
+        - name: "Download Calico custom resource manifest"
+          ansible.builtin.get_url:
+            url: "https://raw.githubusercontent.com/projectcalico/calico/v{{ calico_version }}/manifests/custom-resources.yaml"
+            dest: "/tmp"
+
+        - name: "Update PodNetwork CIDR to {{ pod_network_cidr }}"
+          ansible.builtin.replace:
+            path: "/tmp/custom-resources.yaml"
+            regexp: '(^\s*cidr:)\s*([0-9]{1,3}\.){3}[0-9]{1,3}($|/(16|24))'
+            replace: '\1 {{ pod_network_cidr }}'
+
+        - name: "Create Calico custom resources"
+          ansible.builtin.shell: |
+            kubectl create -f /tmp/custom-resources.yaml
+
+# FIXME : not working...
+#        - name: "Wait until all calico pods are ready"
+#          ansible.builtin.shell: |
+#            kubectl get pods -n calico-system -o json | \
+#            jq '.items[].status.containerStatuses[]' | \
+#            jq 'select(.ready == false) | .ready' | \
+#            wc -l
+#          retries: "{{ calico_wait_retry }}"
+#          delay: "{{ calico_wait_interval }}"
+#          register: result
+#          until: result.stdout == '0'
+#          when: calico_wait == true
+#          changed_when: false
+
+- name: "Worker nodes"
+  hosts: worker_nodes
+  become: true
+  tasks:
+    - name: "Join cluster"
+      ansible.builtin.shell: "{{ hostvars['K8S_TOKEN_HOLDER']['join_command'] }}"
